@@ -147,6 +147,61 @@ static void getDebugLoc(const Instruction *I, std::string &Filename,
 #endif /* LLVM_OLD_DEBUG_API */
 }
 
+#include <set>
+#include <utility>
+
+static std::string jsonEscape(const std::string &s) {
+  std::string res;
+  for (char c : s) {
+    if (c == '"') res += "\\\"";
+    else if (c == '\\') res += "\\\\";
+    else if (c == '\b') res += "\\b";
+    else if (c == '\f') res += "\\f";
+    else if (c == '\n') res += "\\n";
+    else if (c == '\r') res += "\\r";
+    else if (c == '\t') res += "\\t";
+    else res += c;
+  }
+  return res;
+}
+
+static void getDebugLocFull(const Instruction *I, std::string &Filename,
+                            std::string &Directory, unsigned &Line) {
+  Filename.clear();
+  Directory.clear();
+  Line = 0;
+#ifdef LLVM_OLD_DEBUG_API
+  DebugLoc Loc = I->getDebugLoc();
+  if (!Loc.isUnknown()) {
+    DILocation cDILoc(Loc.getAsMDNode(M.getContext()));
+    DILocation oDILoc = cDILoc.getOrigLocation();
+
+    Line = oDILoc.getLineNumber();
+    Filename = oDILoc.getFilename().str();
+
+    if (Filename.empty()) {
+      Line = cDILoc.getLineNumber();
+      Filename = cDILoc.getFilename().str();
+    }
+  }
+#else
+  if (DILocation *Loc = I->getDebugLoc()) {
+    Line = Loc->getLine();
+    Filename = Loc->getFilename().str();
+    Directory = Loc->getDirectory().str();
+
+    if (Filename.empty()) {
+      DILocation *oDILoc = Loc->getInlinedAt();
+      if (oDILoc) {
+        Line = oDILoc->getLine();
+        Filename = oDILoc->getFilename().str();
+        Directory = oDILoc->getDirectory().str();
+      }
+    }
+  }
+#endif /* LLVM_OLD_DEBUG_API */
+}
+
 static bool isBlacklisted(const Function *F) {
   static const SmallVector<std::string, 8> Blacklist = {
     "asan.",
@@ -303,9 +358,23 @@ bool AFLCoverage::runOnModule(Module &M) {
         std::string bb_name("");
         std::string filename;
         unsigned line;
+        std::set<std::pair<std::string, unsigned>> bb_source_lines;
+        std::string bb_source_root("");
 
         for (auto &I : BB) {
           getDebugLoc(&I, filename, line);
+
+          std::string full_fn, dir_fn;
+          unsigned debug_line = 0;
+          getDebugLocFull(&I, full_fn, dir_fn, debug_line);
+          if (!full_fn.empty() && debug_line != 0) {
+            static const std::string Xlibs_full("/usr/");
+            if (full_fn.compare(0, Xlibs_full.size(), Xlibs_full) != 0) {
+              if (bb_source_root.empty() && !dir_fn.empty())
+                bb_source_root = dir_fn;
+              bb_source_lines.insert({full_fn, debug_line});
+            }
+          }
 
           /* Don't worry about external libs */
           static const std::string Xlibs("/usr/");
@@ -362,6 +431,32 @@ bool AFLCoverage::runOnModule(Module &M) {
 
           bbnames << BB.getName().str() << "\n";
           has_BBs = true;
+
+          /* Export block mapping metadata */
+          std::string block_id = BB.getName().str();
+          std::string mod_name = M.getSourceFileName();
+          if (mod_name.empty()) mod_name = M.getName().str();
+
+          std::string json_line = "{\"module\":\"" + jsonEscape(mod_name) +
+                                  "\",\"function\":\"" + jsonEscape(funcName) +
+                                  "\",\"block_id\":\"" + jsonEscape(block_id) +
+                                  "\",\"distance_key\":\"" + jsonEscape(bb_name) +
+                                  "\",\"source_root\":\"" + jsonEscape(bb_source_root) +
+                                  "\",\"source_lines\":[";
+          bool first = true;
+          for (auto const &sl : bb_source_lines) {
+            if (!first) json_line += ",";
+            first = false;
+            json_line += "{\"file\":\"" + jsonEscape(sl.first) + "\",\"line\":" + std::to_string(sl.second) + "}";
+          }
+          json_line += "]}";
+
+          std::ofstream blockmap(OutDirectory + "/block_mapping.jsonl", std::ofstream::out | std::ofstream::app);
+          blockmap << json_line << "\n";
+
+          sys::fs::create_directory(OutDirectory + "/block_mappings");
+          std::ofstream blockmap_pid(OutDirectory + "/block_mappings/" + std::to_string(getpid()) + ".jsonl", std::ofstream::out | std::ofstream::app);
+          blockmap_pid << json_line << "\n";
 
 #ifdef AFLGO_TRACING
           auto *TI = BB.getTerminator();

@@ -3412,7 +3412,7 @@ keep_as_crash:
 #ifndef SIMPLE_FILES
 
 #  if AFLGO_IMPL
-      fn = alloc_printf("%s/crashes/id:%06llu,%llu,sig:%02u,%s", out_dir,
+      fn = alloc_printf("%s/crashes/id:%06llu,time:%llu,sig:%02u,%s", out_dir,
                         unique_crashes, get_cur_time() - start_time,
                         kill_signal, describe_op(0));
 #  else
